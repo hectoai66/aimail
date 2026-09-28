@@ -1,0 +1,117 @@
+﻿name: relay-cron
+# 시나리오 A · 릴레이 PC 대체 백업 (GitHub Actions 5분 cron)
+#   · send_queue → Resend HTTPS API 는 Cloudflare Worker 안에서 이미 자동 flush (10분 cron)
+#     이 워크플로는 백업 + AI드라이브 업로드 큐 소비 담당
+#   · 필요한 Secrets:
+#       WORKER_BASE          (예: https://hecto-torres-worker.hectoai240.workers.dev)
+#       RELAY_TOKEN          (워커 시크릿과 동일)
+#       NW_SMTP_USER         (백업 SMTP 발송용 · Resend 실패 시 fallback)
+#       NW_SMTP_PASS
+#       GSK_API_KEY          (aidrive 업로드용 gsk CLI 인증)
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # 5분마다
+  workflow_dispatch:         # 수동 실행 버튼
+    inputs:
+      task:
+        description: '실행할 작업'
+        required: false
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - flush_only
+          - aidrive_only
+
+concurrency:
+  group: relay-cron
+  cancel-in-progress: false
+
+jobs:
+  # ── 1) send_queue 강제 flush (Resend가 10분 cron 인 걸 5분으로 앞당김)
+  flush_send_queue:
+    if: ${{ github.event_name == 'schedule' || inputs.task == 'both' || inputs.task == 'flush_only' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: send_queue flush 호출 (Worker Resend)
+        run: |
+          curl -sS -X POST \
+            "${{ secrets.WORKER_BASE }}/api/queue/flush" \
+            -H "Content-Type: application/json" \
+            -d '{"limit":50}' | tee /tmp/flush.json
+          echo ""
+          jq -r '"processed=\(.processed) sent=\(.sent) failed=\(.failed)"' /tmp/flush.json || true
+
+  # ── 2) SMTP 백업 발송 (Resend 완전 실패했을 때만)
+  smtp_backup:
+    if: ${{ github.event_name == 'schedule' || inputs.task == 'both' || inputs.task == 'flush_only' }}
+    needs: flush_send_queue
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: install
+        working-directory: relay
+        run: npm ci --omit=dev || npm install --omit=dev
+      - name: pending 잔량 확인
+        id: check
+        run: |
+          set -e
+          STATUS=$(curl -sS "${{ secrets.WORKER_BASE }}/api/queue/status")
+          echo "$STATUS"
+          PENDING=$(echo "$STATUS" | jq -r '.status.pending // 0')
+          echo "pending=$PENDING" >> $GITHUB_OUTPUT
+      - name: SMTP fallback (--once)
+        if: ${{ steps.check.outputs.pending != '0' }}
+        working-directory: relay
+        timeout-minutes: 4
+        env:
+          WORKER_BASE: ${{ secrets.WORKER_BASE }}
+          RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
+          NW_SMTP_USER: ${{ secrets.NW_SMTP_USER }}
+          NW_SMTP_PASS: ${{ secrets.NW_SMTP_PASS }}
+          BATCH: '20'
+          PER_MAIL_MS: '1500'
+        run: node send-relay.js --once
+
+  # ── 3) AI드라이브 업로드 큐 소비
+  aidrive_upload:
+    if: ${{ github.event_name == 'schedule' || inputs.task == 'both' || inputs.task == 'aidrive_only' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: gsk CLI 설치
+        run: |
+          curl -fsSL https://cli.genspark.ai/install.sh | bash || true
+          echo "$HOME/.gsk/bin" >> $GITHUB_PATH
+          echo "GSK_API_KEY=${{ secrets.GSK_API_KEY }}" >> $GITHUB_ENV
+      - name: install
+        working-directory: relay
+        run: npm ci --omit=dev || npm install --omit=dev
+      - name: AI드라이브 큐 pop (--once)
+        working-directory: relay
+        timeout-minutes: 4
+        env:
+          WORKER_URL: ${{ secrets.WORKER_BASE }}
+          RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
+          GSK_BIN: gsk
+          MAX_ONCE: '10'
+        run: node aidrive-uploader.js --once
+
+  # ── 4) 상태 리포트 (실패 감지 · GitHub Actions summary)
+  summary:
+    if: ${{ always() }}
+    needs: [flush_send_queue, smtp_backup, aidrive_upload]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 큐 상태 요약
+        run: |
+          echo "### 릴레이 크론 결과 · $(date -u +%FT%TZ)" >> $GITHUB_STEP_SUMMARY
+          STATUS=$(curl -sS "${{ secrets.WORKER_BASE }}/api/queue/status") || true
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          echo "$STATUS" | jq . >> $GITHUB_STEP_SUMMARY || echo "$STATUS" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
