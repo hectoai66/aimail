@@ -1,8 +1,7 @@
 name: relay-cron
-# 슬림 버전 v2 (2026-09-29)
-#   · 실제 발송은 Cloudflare Worker 내부 cron 이 담당
-#   · 이 워크플로는 발송 큐 강제 flush + 7일 요약 조회만 수행
-#   · npm/외부 CLI 의존 제거 → npm ci 실패 원천 차단
+# v3 (2026-09-29) · 순수 curl + Node inline nodemailer
+#   · package.json 불필요 → npm ci 실패 원천 차단
+#   · 워커 pop 응답에 SMTP 자격증명 포함 → 시크릿 참조 최소화
 #   · 필요한 Secrets:
 #       WORKER_BASE   (예: https://hecto-torres-worker.hectoai240.workers.dev)
 #       RELAY_TOKEN   (Worker 시크릿과 동일)
@@ -31,16 +30,107 @@ jobs:
             -H "X-Relay-Token: ${{ secrets.RELAY_TOKEN }}" \
             -d '{"limit":50}')
           echo "$RESP"
-          echo "$RESP" | jq -r '"processed=\(.processed // 0) sent=\(.sent // 0) failed=\(.failed // 0)"' || true
 
-  # ── 2) 발송 요약 조회 (7일)
-  summary:
+  # ── 2) SMTP 실전송 (pop → nodemailer 전송 → done)
+  smtp_send:
     runs-on: ubuntu-latest
     needs: flush_send_queue
-    timeout-minutes: 2
+    timeout-minutes: 5
     steps:
-      - name: 발송 요약 조회
+      - name: 큐 pop
+        id: pop
         run: |
           set -e
-          RESP=$(curl -sS "${{ secrets.WORKER_BASE }}/api/send/summary")
-          echo "$RESP"
+          POP=$(curl -sS -X POST \
+            "${{ secrets.WORKER_BASE }}/api/queue/pop" \
+            -H "Content-Type: application/json" \
+            -H "X-Relay-Token: ${{ secrets.RELAY_TOKEN }}" \
+            -d '{"limit":20}')
+          echo "$POP" > /tmp/pop.json
+          COUNT=$(echo "$POP" | python3 -c "import sys,json;print(len(json.load(sys.stdin).get('jobs',[])))")
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          echo "pop 결과: $COUNT 건"
+
+      - name: 종료 (큐 비어있음)
+        if: steps.pop.outputs.count == '0'
+        run: echo "발송할 잡 없음 · 정상 종료"
+
+      - name: nodemailer 설치
+        if: steps.pop.outputs.count != '0'
+        run: |
+          npm install --silent --no-package-lock --no-save nodemailer@6.9.14
+
+      - name: SMTP 발송 + 결과 보고
+        if: steps.pop.outputs.count != '0'
+        env:
+          WORKER_BASE: ${{ secrets.WORKER_BASE }}
+          RELAY_TOKEN: ${{ secrets.RELAY_TOKEN }}
+        run: |
+          node <<'JS'
+          const fs = require('fs');
+          const https = require('https');
+          const nodemailer = require('nodemailer');
+          const pop = JSON.parse(fs.readFileSync('/tmp/pop.json', 'utf8'));
+          const { jobs, sender, smtp } = pop;
+
+          const transporter = nodemailer.createTransport({
+            host: smtp.host,
+            port: smtp.port,
+            secure: smtp.secure,
+            auth: { user: smtp.user, pass: smtp.pass }
+          });
+
+          const results = [];
+          (async () => {
+            for (const j of jobs) {
+              try {
+                const info = await transporter.sendMail({
+                  from: `"${sender.name}" <${sender.email}>`,
+                  replyTo: sender.reply_to || sender.email,
+                  to: j.to_name ? `"${j.to_name}" <${j.to_email}>` : j.to_email,
+                  subject: j.subject,
+                  html: j.html
+                });
+                console.log(`OK id=${j.id} to=${j.to_email} messageId=${info.messageId}`);
+                results.push({ id: j.id, status: 'sent' });
+              } catch (e) {
+                console.error(`FAIL id=${j.id} to=${j.to_email}:`, e.message);
+                results.push({ id: j.id, status: 'failed', error: String(e.message).slice(0, 500) });
+              }
+            }
+
+            // done 보고
+            const body = JSON.stringify({ jobs: results });
+            const url = new URL('/api/queue/done', process.env.WORKER_BASE);
+            const req = https.request({
+              method: 'POST',
+              hostname: url.hostname,
+              path: url.pathname,
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Relay-Token': process.env.RELAY_TOKEN,
+                'Content-Length': Buffer.byteLength(body)
+              }
+            }, res => {
+              let d = '';
+              res.on('data', c => d += c);
+              res.on('end', () => {
+                console.log(`done HTTP=${res.statusCode} body=${d}`);
+                if (results.some(r => r.status === 'failed')) process.exit(1);
+              });
+            });
+            req.on('error', e => { console.error('done error', e); process.exit(1); });
+            req.write(body);
+            req.end();
+          })();
+          JS
+
+  # ── 3) 상태 조회
+  summary:
+    runs-on: ubuntu-latest
+    needs: smtp_send
+    timeout-minutes: 2
+    steps:
+      - name: 큐 상태 조회
+        run: |
+          curl -sS "${{ secrets.WORKER_BASE }}/api/queue/status"
